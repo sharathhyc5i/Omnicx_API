@@ -655,6 +655,31 @@ def get_all_records(
             conn.close()
 
 
+import socket
+
+@app.get("/api/network-test")
+def network_test():
+    result = {}
+
+    try:
+        result["hostname"] = SQL_SERVER
+        result["resolved_ip"] = socket.gethostbyname(SQL_SERVER)
+    except Exception as e:
+        result["dns_error"] = str(e)
+
+    try:
+        sock = socket.create_connection(
+            (SQL_SERVER, 1433),
+            timeout=10
+        )
+        sock.close()
+        result["tcp_1433"] = "reachable"
+    except Exception as e:
+        result["tcp_1433"] = f"failed: {str(e)}"
+
+    return result
+    
+
 # =========================================================
 # START APPLICATION
 # =========================================================
