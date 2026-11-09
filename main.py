@@ -296,36 +296,42 @@ def get_all_records():
 )
 def create_or_update_user_login(payload: UserLoginCreate, response: Response):
     """
-    Saves a user's login session.
+    Saves a user's login session. Call it twice per session:
 
-    - New user_id: inserts a row (returns 201).
-    - Existing user_id: updates that user's row (returns 200) with the
-      latest session times, name, email and role.
-    - Session time (login_datetime_end - login_datetime_start) is added to
-      total_time_spent_mins / total_time_spent_hrs. A session without
-      login_datetime_end adds 0 (e.g. the call made at login time).
-    - login_datetime_start defaults to now (UTC); user_role defaults to 'admin'.
+    1. At LOGIN  - send without login_datetime_end.
+       Saves login_datetime_start (defaults to now) and marks the
+       session as open (login_datetime_end = NULL). Adds 0 minutes.
+
+    2. At LOGOUT - send with login_datetime_end.
+       If the user has an open session, the duration is measured from the
+       login_datetime_start SAVED AT LOGIN, so the frontend does not need to
+       remember the login time. The session is then closed, so a repeated
+       logout call cannot count the same session twice.
+
+    - New user_id: inserts a row (201). Existing user_id: updates it (200).
+    - Duration is added to total_time_spent_mins / total_time_spent_hrs.
+    - user_role defaults to 'admin'.
     """
 
-    login_start = payload.login_datetime_start or datetime.now(timezone.utc)
-    login_end = payload.login_datetime_end
+    def as_utc(dt):
+        if dt is None:
+            return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
-    # Treat timestamps without a timezone as UTC so they can be compared.
-    if login_start.tzinfo is None:
-        login_start = login_start.replace(tzinfo=timezone.utc)
-    if login_end is not None and login_end.tzinfo is None:
-        login_end = login_end.replace(tzinfo=timezone.utc)
+    sent_start = as_utc(payload.login_datetime_start)
+    login_end = as_utc(payload.login_datetime_end)
+    now = datetime.now(timezone.utc)
 
-    if login_end and login_end < login_start:
-        raise HTTPException(
-            status_code=422,
-            detail="login_datetime_end cannot be earlier than login_datetime_start."
-        )
-
-    session_mins = (
-        round((login_end - login_start).total_seconds() / 60, 2)
-        if login_end else 0.0
-    )
+    def minutes_between(start, end):
+        if end < start:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "login_datetime_end cannot be earlier than the session's "
+                    f"login_datetime_start ({start.isoformat()})."
+                )
+            )
+        return round((end - start).total_seconds() / 60, 2)
 
     conn = get_pg_connection()
 
@@ -341,7 +347,8 @@ def create_or_update_user_login(payload: UserLoginCreate, response: Response):
 
                 cur.execute(
                     """
-                    SELECT id, total_time_spent_mins
+                    SELECT id, total_time_spent_mins,
+                           login_datetime_start, login_datetime_end
                     FROM public.user_login_details
                     WHERE user_id = %s
                     ORDER BY id DESC
@@ -353,6 +360,22 @@ def create_or_update_user_login(payload: UserLoginCreate, response: Response):
                 existing = cur.fetchone()
 
                 if existing:
+                    if login_end is None:
+                        # LOGIN: open a new session.
+                        session_start = sent_start or now
+                        session_mins = 0.0
+
+                    elif existing["login_datetime_end"] is None:
+                        # LOGOUT of an open session: use the saved login time.
+                        session_start = existing["login_datetime_start"]
+                        session_mins = minutes_between(session_start, login_end)
+
+                    else:
+                        # Session already closed: only count it if the caller
+                        # sends a full, distinct start/end pair.
+                        session_start = sent_start or login_end
+                        session_mins = minutes_between(session_start, login_end)
+
                     new_total_mins = round(
                         float(existing["total_time_spent_mins"] or 0) + session_mins, 2
                     )
@@ -375,7 +398,7 @@ def create_or_update_user_login(payload: UserLoginCreate, response: Response):
                             payload.user_name,
                             payload.user_email.lower(),
                             payload.user_role or "admin",
-                            login_start,
+                            session_start,
                             login_end,
                             new_total_mins,
                             round(new_total_mins / 60, 2),
@@ -385,6 +408,11 @@ def create_or_update_user_login(payload: UserLoginCreate, response: Response):
                     response.status_code = status.HTTP_200_OK
 
                 else:
+                    session_start = sent_start or now
+                    session_mins = (
+                        minutes_between(session_start, login_end) if login_end else 0.0
+                    )
+
                     cur.execute(
                         f"""
                         INSERT INTO public.user_login_details (
@@ -399,7 +427,7 @@ def create_or_update_user_login(payload: UserLoginCreate, response: Response):
                             payload.user_id,
                             payload.user_name,
                             payload.user_email.lower(),
-                            login_start,
+                            session_start,
                             login_end,
                             payload.user_role or "admin",
                             session_mins,
@@ -410,6 +438,9 @@ def create_or_update_user_login(payload: UserLoginCreate, response: Response):
                 row = cur.fetchone()
 
         return UserLoginResponse(**row)
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         print(f"[POST FAILED] Error saving user login: {e}")
