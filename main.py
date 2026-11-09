@@ -3,11 +3,10 @@ import pyodbc
 import psycopg2
 import psycopg2.extras
 
-
 from datetime import datetime, timezone
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -86,6 +85,7 @@ PG_CONFIG = {
     "port": int(os.getenv("PG_PORT", "5432")),
     "database": os.getenv("PG_DATABASE", "postgres"),
     "sslmode": os.getenv("PG_SSLMODE", "require"),  # Azure requires SSL
+    "connect_timeout": int(os.getenv("PG_CONNECT_TIMEOUT", "10")),  # never hang startup
 }
 
 
@@ -331,6 +331,75 @@ def create_user_login(payload: UserLoginCreate):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database insert error: {str(e)}"
+        )
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------
+# GET LOGIN USERS (PostgreSQL)
+# ---------------------------------------------------------
+
+@app.get(
+    "/api/login-users",
+    response_model=List[UserLoginResponse]
+)
+def get_login_users(
+    user_id: Optional[str] = Query(None, description="Filter by user_id"),
+    user_email: Optional[str] = Query(None, description="Filter by email"),
+    user_role: Optional[str] = Query(None, description="Filter by role"),
+    limit: int = Query(100, ge=1, le=1000, description="Max rows to return"),
+    offset: int = Query(0, ge=0, description="Rows to skip (for paging)")
+):
+    """
+    Returns user login records, newest first.
+    All filters are optional; with none, returns the latest 100 records.
+    """
+
+    conditions = []
+    params = []
+
+    if user_id:
+        conditions.append("user_id = %s")
+        params.append(user_id)
+
+    if user_email:
+        conditions.append("LOWER(user_email) = LOWER(%s)")
+        params.append(user_email)
+
+    if user_role:
+        conditions.append("user_role = %s")
+        params.append(user_role)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    select_query = f"""
+        SELECT
+            id, user_id, user_name, user_email,
+            login_datetime_start, login_datetime_end,
+            user_role, created_at
+        FROM public.user_login_details
+        {where_clause}
+        ORDER BY login_datetime_start DESC
+        LIMIT %s OFFSET %s;
+    """
+    params.extend([limit, offset])
+
+    conn = get_pg_connection()
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(select_query, params)
+            rows = cur.fetchall()
+
+        return [UserLoginResponse(**row) for row in rows]
+
+    except Exception as e:
+        print(f"[GET FAILED] Error querying user logins: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database query error: {str(e)}"
         )
 
     finally:
