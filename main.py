@@ -34,7 +34,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Restrict this in production
     allow_credentials=True,
-    allow_methods=["GET", "POST"],  # POST added for /api/user-login
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -400,6 +400,52 @@ def get_login_users(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database query error: {str(e)}"
+        )
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------
+# DELETE ALL LOGIN USERS (PostgreSQL)
+# ---------------------------------------------------------
+
+@app.delete("/api/login-users")
+def delete_all_login_users(
+    confirm: bool = Query(
+        False,
+        description="Must be true to delete. Prevents accidental wipes."
+    )
+):
+    """
+    Permanently deletes ALL records from user_login_details.
+    Requires ?confirm=true. This cannot be undone.
+    """
+
+    if not confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This deletes ALL login records. Call again with ?confirm=true to proceed."
+        )
+
+    conn = get_pg_connection()
+
+    try:
+        with conn:  # commits on success, rolls back on error
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM public.user_login_details;")
+                deleted = cur.rowcount
+
+        return {
+            "message": "All login records deleted.",
+            "deleted_count": deleted
+        }
+
+    except Exception as e:
+        print(f"[DELETE FAILED] Error deleting user logins: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database delete error: {str(e)}"
         )
 
     finally:
