@@ -6,7 +6,7 @@ import psycopg2.extras
 from datetime import datetime, timezone
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -120,6 +120,14 @@ CREATE_USER_LOGIN_TABLE = """
 
     CREATE INDEX IF NOT EXISTS idx_user_login_details_user_id
         ON public.user_login_details (user_id);
+
+    -- Running totals (added safely to an existing table too)
+    ALTER TABLE public.user_login_details
+        ADD COLUMN IF NOT EXISTS total_time_spent_mins NUMERIC(14, 2) NOT NULL DEFAULT 0;
+    ALTER TABLE public.user_login_details
+        ADD COLUMN IF NOT EXISTS total_time_spent_hrs  NUMERIC(12, 2) NOT NULL DEFAULT 0;
+    ALTER TABLE public.user_login_details
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 """
 
 
@@ -184,7 +192,18 @@ class UserLoginResponse(BaseModel):
     login_datetime_start: datetime
     login_datetime_end: Optional[datetime] = None
     user_role: str
+    total_time_spent_mins: float = 0.0
+    total_time_spent_hrs: float = 0.0
     created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+USER_LOGIN_COLUMNS = """
+    id, user_id, user_name, user_email,
+    login_datetime_start, login_datetime_end,
+    user_role, total_time_spent_mins, total_time_spent_hrs,
+    created_at, updated_at
+"""
 
 
 # ---------------------------------------------------------
@@ -275,62 +294,128 @@ def get_all_records():
     response_model=UserLoginResponse,
     status_code=status.HTTP_201_CREATED
 )
-def create_user_login(payload: UserLoginCreate):
+def create_or_update_user_login(payload: UserLoginCreate, response: Response):
     """
-    Saves a user login record.
-    - login_datetime_start defaults to the current UTC time.
-    - user_role defaults to 'admin'.
+    Saves a user's login session.
+
+    - New user_id: inserts a row (returns 201).
+    - Existing user_id: updates that user's row (returns 200) with the
+      latest session times, name, email and role.
+    - Session time (login_datetime_end - login_datetime_start) is added to
+      total_time_spent_mins / total_time_spent_hrs. A session without
+      login_datetime_end adds 0 (e.g. the call made at login time).
+    - login_datetime_start defaults to now (UTC); user_role defaults to 'admin'.
     """
 
     login_start = payload.login_datetime_start or datetime.now(timezone.utc)
+    login_end = payload.login_datetime_end
 
-    if payload.login_datetime_end and payload.login_datetime_end < login_start:
+    # Treat timestamps without a timezone as UTC so they can be compared.
+    if login_start.tzinfo is None:
+        login_start = login_start.replace(tzinfo=timezone.utc)
+    if login_end is not None and login_end.tzinfo is None:
+        login_end = login_end.replace(tzinfo=timezone.utc)
+
+    if login_end and login_end < login_start:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="login_datetime_end cannot be earlier than login_datetime_start."
         )
 
-    insert_query = """
-        INSERT INTO public.user_login_details (
-            user_id,
-            user_name,
-            user_email,
-            login_datetime_start,
-            login_datetime_end,
-            user_role
-        )
-        VALUES (%s, %s, %s, %s, %s, %s)
-        RETURNING
-            id, user_id, user_name, user_email,
-            login_datetime_start, login_datetime_end,
-            user_role, created_at;
-    """
+    session_mins = (
+        round((login_end - login_start).total_seconds() / 60, 2)
+        if login_end else 0.0
+    )
 
     conn = get_pg_connection()
 
     try:
         with conn:  # commits on success, rolls back on error
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+                # Serialise concurrent calls for the same user_id.
                 cur.execute(
-                    insert_query,
-                    (
-                        payload.user_id,
-                        payload.user_name,
-                        payload.user_email.lower(),
-                        login_start,
-                        payload.login_datetime_end,
-                        payload.user_role or "admin",
-                    )
+                    "SELECT pg_advisory_xact_lock(hashtext(%s));",
+                    (payload.user_id,)
                 )
+
+                cur.execute(
+                    """
+                    SELECT id, total_time_spent_mins
+                    FROM public.user_login_details
+                    WHERE user_id = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    FOR UPDATE;
+                    """,
+                    (payload.user_id,)
+                )
+                existing = cur.fetchone()
+
+                if existing:
+                    new_total_mins = round(
+                        float(existing["total_time_spent_mins"] or 0) + session_mins, 2
+                    )
+
+                    cur.execute(
+                        f"""
+                        UPDATE public.user_login_details
+                        SET user_name             = %s,
+                            user_email            = %s,
+                            user_role             = %s,
+                            login_datetime_start  = %s,
+                            login_datetime_end    = %s,
+                            total_time_spent_mins = %s,
+                            total_time_spent_hrs  = %s,
+                            updated_at            = NOW()
+                        WHERE id = %s
+                        RETURNING {USER_LOGIN_COLUMNS};
+                        """,
+                        (
+                            payload.user_name,
+                            payload.user_email.lower(),
+                            payload.user_role or "admin",
+                            login_start,
+                            login_end,
+                            new_total_mins,
+                            round(new_total_mins / 60, 2),
+                            existing["id"],
+                        )
+                    )
+                    response.status_code = status.HTTP_200_OK
+
+                else:
+                    cur.execute(
+                        f"""
+                        INSERT INTO public.user_login_details (
+                            user_id, user_name, user_email,
+                            login_datetime_start, login_datetime_end,
+                            user_role, total_time_spent_mins, total_time_spent_hrs
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING {USER_LOGIN_COLUMNS};
+                        """,
+                        (
+                            payload.user_id,
+                            payload.user_name,
+                            payload.user_email.lower(),
+                            login_start,
+                            login_end,
+                            payload.user_role or "admin",
+                            session_mins,
+                            round(session_mins / 60, 2),
+                        )
+                    )
+
                 row = cur.fetchone()
 
         return UserLoginResponse(**row)
 
     except Exception as e:
-        print(f"[POST FAILED] Error inserting user login: {e}")
+        print(f"[POST FAILED] Error saving user login: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database insert error: {str(e)}"
+            detail=f"Database save error: {str(e)}"
         )
 
     finally:
@@ -375,10 +460,7 @@ def get_login_users(
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     select_query = f"""
-        SELECT
-            id, user_id, user_name, user_email,
-            login_datetime_start, login_datetime_end,
-            user_role, created_at
+        SELECT {USER_LOGIN_COLUMNS}
         FROM public.user_login_details
         {where_clause}
         ORDER BY login_datetime_start DESC
